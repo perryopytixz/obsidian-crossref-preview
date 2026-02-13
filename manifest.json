@@ -1,0 +1,9 @@
+{
+  "id": "obsidian-crossref-preview",
+  "name": "Obsidian Crossref Preview",
+  "version": "0.1.35",
+  "minAppVersion": "1.5.0",
+  "description": "Preview-only Quarto-style cross references for equations, figures, and theorem blocks.",
+  "author": "Perry",
+  "isDesktopOnly": false
+}
