@@ -21,8 +21,16 @@ const REF_PATTERN = new RegExp(`@(${LABEL_FRAGMENT})`, "g");
 const LABEL_TOKEN_PATTERN = new RegExp(`\\{#(${LABEL_FRAGMENT})\\}`, "g");
 const NATIVE_FLASH_SUPPRESS_CLASS = "crossref-suppress-native-flash";
 const NATIVE_FLASH_SUPPRESS_DURATION_MS = 1600;
+const TARGET_FLASH_DURATION_MS = 1200;
+const FALLBACK_NAV_RENDER_WAIT_MS = 90;
+const EQUATION_LABEL_ONLY_PATTERN = /^\{#(eq-[A-Za-z0-9_-]+)\}$/;
+const EQUATION_FENCE_CLOSE_PATTERN = /^\$\$\s*(?:\{#(eq-[A-Za-z0-9_-]+)\})?\s*$/;
+const EQUATION_SINGLE_LINE_PATTERN = /^\$\$.*\$\$\s*(?:\{#(eq-[A-Za-z0-9_-]+)\})?\s*$/;
 const THEOREM_START_PATTERN = new RegExp(
   `^:::\\s*\\{#(${THEOREM_PREFIX_FRAGMENT}-[A-Za-z0-9_-]+)\\}\\s*$`
+);
+const THEOREM_START_PREFIX_PATTERN = new RegExp(
+  `^:::\\s*\\{#(${THEOREM_PREFIX_FRAGMENT}-[A-Za-z0-9_-]+)\\}`
 );
 const THEOREM_END_PATTERN = /^:::\s*$/;
 
@@ -150,22 +158,74 @@ function safeStringify(value) {
   });
 }
 
-function dedupeElements(elements) {
-  const seen = new Set();
-  const unique = [];
-
-  for (const element of elements) {
-    if (!(element instanceof HTMLElement)) {
-      continue;
-    }
-    if (seen.has(element)) {
-      continue;
-    }
-    seen.add(element);
-    unique.push(element);
+function normalizeEquationLabelSource(source) {
+  if (!source || !source.includes("$$") || !source.includes("{#eq-")) {
+    return source;
   }
 
-  return unique;
+  const lines = source.split(/\r?\n/);
+  const normalized = [];
+  let changed = false;
+  let codeFenceMarker = "";
+  let codeFenceLength = 0;
+
+  for (const line of lines) {
+    const codeFenceMatch = line.match(/^(\s*)(`{3,}|~{3,})/);
+    if (codeFenceMatch) {
+      const marker = codeFenceMatch[2].charAt(0);
+      const length = codeFenceMatch[2].length;
+
+      if (!codeFenceMarker) {
+        codeFenceMarker = marker;
+        codeFenceLength = length;
+      } else if (codeFenceMarker === marker && length >= codeFenceLength) {
+        codeFenceMarker = "";
+        codeFenceLength = 0;
+      }
+
+      normalized.push(line);
+      continue;
+    }
+
+    if (codeFenceMarker) {
+      normalized.push(line);
+      continue;
+    }
+
+    const closeFenceMatch = line.match(/^(\s*)\$\$\s*\{#(eq-[A-Za-z0-9_-]+)\}\s*$/);
+    if (closeFenceMatch) {
+      const indent = closeFenceMatch[1] || "";
+      const label = closeFenceMatch[2];
+      normalized.push(`${indent}$$`);
+      normalized.push(`${indent}{#${label}}`);
+      changed = true;
+      continue;
+    }
+
+    const inlineMatch = line.match(
+      /^(\s*)\$\$\s*(.+?)\s*\$\$\s*\{#(eq-[A-Za-z0-9_-]+)\}\s*$/
+    );
+    if (inlineMatch) {
+      const indent = inlineMatch[1] || "";
+      const body = (inlineMatch[2] || "").trim();
+      const label = inlineMatch[3];
+      normalized.push(`${indent}$$`);
+      if (body) {
+        normalized.push(`${indent}${body}`);
+      }
+      normalized.push(`${indent}$$`);
+      normalized.push(`${indent}{#${label}}`);
+      changed = true;
+      continue;
+    }
+
+    normalized.push(line);
+  }
+
+  if (!changed) {
+    return source;
+  }
+  return normalized.join("\n");
 }
 
 function parseCrossrefIndex(source) {
@@ -209,39 +269,82 @@ function parseCrossrefIndex(source) {
   };
 
   for (let i = 0; i < lines.length; i += 1) {
-    if (lines[i].trim() !== "$$") {
+    const trimmed = lines[i].trim();
+    if (!trimmed.startsWith("$$")) {
       continue;
     }
 
-    let endLine = -1;
-    for (let j = i + 1; j < lines.length; j += 1) {
-      if (lines[j].trim() === "$$") {
+    let equationStartLine = i;
+    let equationEndLine = i;
+    let labelLine = -1;
+    let label = "";
+
+    const singleLineMatch = trimmed.match(EQUATION_SINGLE_LINE_PATTERN);
+    if (singleLineMatch && trimmed !== "$$") {
+      label = singleLineMatch[1] || "";
+      if (!label) {
+        let lookAhead = i + 1;
+        while (lookAhead < lines.length && lines[lookAhead].trim() === "") {
+          lookAhead += 1;
+        }
+        if (lookAhead < lines.length) {
+          const labelMatch = lines[lookAhead].trim().match(EQUATION_LABEL_ONLY_PATTERN);
+          if (labelMatch) {
+            label = labelMatch[1];
+            labelLine = lookAhead;
+          }
+        }
+      }
+      if (!label) {
+        continue;
+      }
+    } else {
+      let endLine = -1;
+      let closeLineLabel = "";
+      for (let j = i + 1; j < lines.length; j += 1) {
+        const closeMatch = lines[j].trim().match(EQUATION_FENCE_CLOSE_PATTERN);
+        if (!closeMatch) {
+          continue;
+        }
         endLine = j;
+        closeLineLabel = closeMatch[1] || "";
         break;
       }
-    }
 
-    if (endLine < 0) {
-      continue;
-    }
+      if (endLine < 0) {
+        continue;
+      }
 
-    let labelLine = endLine + 1;
-    while (labelLine < lines.length && lines[labelLine].trim() === "") {
-      labelLine += 1;
-    }
+      equationEndLine = endLine;
+      label = closeLineLabel;
+      if (!label) {
+        let lookAhead = endLine + 1;
+        while (lookAhead < lines.length && lines[lookAhead].trim() === "") {
+          lookAhead += 1;
+        }
+        if (lookAhead < lines.length) {
+          const labelMatch = lines[lookAhead].trim().match(EQUATION_LABEL_ONLY_PATTERN);
+          if (labelMatch) {
+            label = labelMatch[1];
+            labelLine = lookAhead;
+          }
+        }
+      }
 
-    if (labelLine < lines.length) {
-      const labelMatch = lines[labelLine].trim().match(/^\{#(eq-[A-Za-z0-9_-]+)\}$/);
-      if (labelMatch) {
-        const blockStartOffset = lineOffsets[i] || 0;
-        const nextLineIndex = labelLine + 1;
-        const blockEndOffset =
-          nextLineIndex < lineOffsets.length ? lineOffsets[nextLineIndex] : source.length;
-        addLabel(labelMatch[1], "equation", blockStartOffset, blockEndOffset);
+      if (!label) {
+        i = endLine;
+        continue;
       }
     }
 
-    i = endLine;
+    const blockStartOffset = lineOffsets[equationStartLine] || 0;
+    const blockEndLine = labelLine >= 0 ? labelLine : equationEndLine;
+    const nextLineIndex = blockEndLine + 1;
+    const blockEndOffset =
+      nextLineIndex < lineOffsets.length ? lineOffsets[nextLineIndex] : source.length;
+    addLabel(label, "equation", blockStartOffset, blockEndOffset);
+
+    i = Math.max(i, equationEndLine);
   }
 
   const figurePattern = /!\[[^\]]*]\([^)]+\)\s*\{#(fig-[A-Za-z0-9_-]+)\}/g;
@@ -507,8 +610,12 @@ class CrossrefPreviewPlugin extends Plugin {
     this.debugLogBuffer = [];
     this.debugLogFlushTimer = null;
     this.nativeFlashSuppressTimer = null;
+    this.originalMarkdownRender = null;
+    this.originalMarkdownRenderMarkdown = null;
 
     await this.resetDebugLogFile();
+
+    this.patchMarkdownRendererEquationLabels();
 
     this.registerMarkdownPostProcessor(async (element, context) => {
       await this.processSection(element, context);
@@ -577,6 +684,7 @@ class CrossrefPreviewPlugin extends Plugin {
   }
 
   onunload() {
+    this.restoreMarkdownRendererEquationLabels();
     this.flushDebugLogs();
     if (this.debugLogFlushTimer) {
       window.clearTimeout(this.debugLogFlushTimer);
@@ -590,6 +698,44 @@ class CrossrefPreviewPlugin extends Plugin {
       document.body.classList.remove(NATIVE_FLASH_SUPPRESS_CLASS);
     }
     this.indexCache.clear();
+  }
+
+  patchMarkdownRendererEquationLabels() {
+    if (this.originalMarkdownRender || this.originalMarkdownRenderMarkdown) {
+      return;
+    }
+
+    if (MarkdownRenderer && typeof MarkdownRenderer.render === "function") {
+      const originalRender = MarkdownRenderer.render;
+      this.originalMarkdownRender = originalRender;
+      MarkdownRenderer.render = function (app, markdown, el, sourcePath, component) {
+        const normalized =
+          typeof markdown === "string" ? normalizeEquationLabelSource(markdown) : markdown;
+        return originalRender.call(this, app, normalized, el, sourcePath, component);
+      };
+    }
+
+    if (MarkdownRenderer && typeof MarkdownRenderer.renderMarkdown === "function") {
+      const originalRenderMarkdown = MarkdownRenderer.renderMarkdown;
+      this.originalMarkdownRenderMarkdown = originalRenderMarkdown;
+      MarkdownRenderer.renderMarkdown = function (markdown, el, sourcePath, component) {
+        const normalized =
+          typeof markdown === "string" ? normalizeEquationLabelSource(markdown) : markdown;
+        return originalRenderMarkdown.call(this, normalized, el, sourcePath, component);
+      };
+    }
+  }
+
+  restoreMarkdownRendererEquationLabels() {
+    if (this.originalMarkdownRender) {
+      MarkdownRenderer.render = this.originalMarkdownRender;
+      this.originalMarkdownRender = null;
+    }
+
+    if (this.originalMarkdownRenderMarkdown) {
+      MarkdownRenderer.renderMarkdown = this.originalMarkdownRenderMarkdown;
+      this.originalMarkdownRenderMarkdown = null;
+    }
   }
 
   getActiveFilePath() {
@@ -740,7 +886,7 @@ class CrossrefPreviewPlugin extends Plugin {
       return null;
     }
 
-    const directStart = directText.match(THEOREM_START_PATTERN);
+    const directStart = directText.match(THEOREM_START_PREFIX_PATTERN);
     if (directStart) {
       const descriptor = index.labels.get(directStart[1]);
       if (!descriptor || descriptor.kind !== "theorem") {
@@ -785,8 +931,7 @@ class CrossrefPreviewPlugin extends Plugin {
       return null;
     }
 
-    const isStartSection =
-      sectionBounds.start <= descriptor.lineStart && sectionBounds.end >= descriptor.lineStart;
+    const isStartSection = sectionBounds.start === descriptor.lineStart;
     const isFullyInside =
       sectionBounds.start >= descriptor.lineStart && sectionBounds.end <= descriptor.lineEnd;
 
@@ -837,6 +982,335 @@ class CrossrefPreviewPlugin extends Plugin {
     }
   }
 
+  getTheoremDescriptorsForSection(index, sectionBounds) {
+    if (!sectionBounds) {
+      return [];
+    }
+
+    return this.getTheoremDescriptors(index).filter((descriptor) => {
+      return descriptor.lineStart >= sectionBounds.start && descriptor.lineStart <= sectionBounds.end;
+    });
+  }
+
+  async renderSourceFragment(lines, startLine, endLine, sourcePath, index) {
+    if (!Array.isArray(lines) || lines.length === 0) {
+      return [];
+    }
+
+    const start = Math.max(0, Math.min(startLine, lines.length - 1));
+    const end = Math.max(start, Math.min(endLine, lines.length - 1));
+    if (end < start) {
+      return [];
+    }
+
+    const rawLines = lines.slice(start, end + 1);
+    const sanitizedLines = [];
+    let inCodeFence = false;
+    let codeFenceMarker = "";
+    let codeFenceLength = 0;
+
+    for (const line of rawLines) {
+      const codeFenceMatch = line.match(/^(\s*)(`{3,}|~{3,})/);
+      if (codeFenceMatch) {
+        const marker = codeFenceMatch[2].charAt(0);
+        const length = codeFenceMatch[2].length;
+
+        if (!inCodeFence) {
+          inCodeFence = true;
+          codeFenceMarker = marker;
+          codeFenceLength = length;
+        } else if (codeFenceMarker === marker && length >= codeFenceLength) {
+          inCodeFence = false;
+          codeFenceMarker = "";
+          codeFenceLength = 0;
+        }
+
+        sanitizedLines.push(line);
+        continue;
+      }
+
+      if (!inCodeFence) {
+        const trimmed = line.trim();
+        if (EQUATION_LABEL_ONLY_PATTERN.test(trimmed)) {
+          continue;
+        }
+        if (trimmed.startsWith(":::")) {
+          continue;
+        }
+      }
+
+      sanitizedLines.push(line);
+    }
+
+    const markdown = sanitizedLines.join("\n");
+    if (!markdown.trim()) {
+      return [];
+    }
+
+    const wrapper = document.createElement("div");
+    await MarkdownRenderer.renderMarkdown(markdown, wrapper, sourcePath, this);
+
+    const sectionTargets = this.selectTargetsForSection(index, {
+      lineStart: start,
+      lineEnd: end
+    });
+    const figureLabels = sectionTargets
+      .filter((descriptor) => descriptor.kind === "figure")
+      .map((descriptor) => descriptor.label);
+
+    this.decorateFigureTargets(wrapper, figureLabels, index);
+    this.stripLabelTokens(wrapper);
+    this.decorateReferences(wrapper, index, sourcePath);
+    this.cleanupOrphanFenceMarkers(wrapper);
+    this.cleanupEmptyParagraphs(wrapper);
+
+    return Array.from(wrapper.childNodes);
+  }
+
+  async renderTheoremMixedSection(
+    element,
+    descriptors,
+    sectionBounds,
+    sourcePath,
+    source,
+    index
+  ) {
+    if (!(element instanceof HTMLElement) || !Array.isArray(descriptors) || descriptors.length === 0) {
+      return false;
+    }
+
+    const lines = source.split(/\r?\n/);
+    const sorted = descriptors.slice().sort((a, b) => {
+      if (a.lineStart !== b.lineStart) {
+        return a.lineStart - b.lineStart;
+      }
+      return a.lineEnd - b.lineEnd;
+    });
+
+    const nodes = [];
+    let cursor = sectionBounds.start;
+    const overlappingLeadingDescriptors = Array.from(index.labels.values()).filter((descriptor) => {
+      if (descriptor.kind !== "equation" && descriptor.kind !== "theorem") {
+        return false;
+      }
+      return descriptor.lineStart < sectionBounds.start && descriptor.lineEnd >= sectionBounds.start;
+    });
+    if (overlappingLeadingDescriptors.length > 0) {
+      const maxOverlapEnd = overlappingLeadingDescriptors.reduce((maxEnd, descriptor) => {
+        return Math.max(maxEnd, descriptor.lineEnd);
+      }, sectionBounds.start - 1);
+      cursor = Math.min(sectionBounds.end + 1, maxOverlapEnd + 1);
+      this.debugLog(sourcePath, "skip leading overlapped descriptor tail", {
+        overlaps: overlappingLeadingDescriptors.map((descriptor) => {
+          return {
+            label: descriptor.label,
+            kind: descriptor.kind,
+            lineStart: descriptor.lineStart,
+            lineEnd: descriptor.lineEnd
+          };
+        }),
+        skipUntil: cursor,
+        lineStart: sectionBounds.start,
+        lineEnd: sectionBounds.end
+      });
+    }
+
+    for (const descriptor of sorted) {
+      if (descriptor.lineStart > cursor) {
+        const leadingNodes = await this.renderSourceFragment(
+          lines,
+          cursor,
+          descriptor.lineStart - 1,
+          sourcePath,
+          index
+        );
+        nodes.push(...leadingNodes);
+      }
+
+      const theoremNode = await this.createTheoremNodeFromSource(
+        descriptor,
+        sourcePath,
+        source,
+        index
+      );
+      nodes.push(theoremNode);
+      cursor = Math.max(cursor, descriptor.lineEnd + 1);
+    }
+
+    if (cursor <= sectionBounds.end) {
+      const trailingNodes = await this.renderSourceFragment(
+        lines,
+        cursor,
+        sectionBounds.end,
+        sourcePath,
+        index
+      );
+      nodes.push(...trailingNodes);
+    }
+
+    if (nodes.length === 0) {
+      return false;
+    }
+
+    element.replaceChildren(...nodes);
+    const sectionTargets = this.selectTargetsForSection(index, {
+      lineStart: sectionBounds.start,
+      lineEnd: sectionBounds.end
+    });
+    const figureLabels = sectionTargets
+      .filter((descriptor) => descriptor.kind === "figure")
+      .map((descriptor) => descriptor.label);
+    this.decorateFigureTargets(element, figureLabels, index);
+    this.stripLabelTokens(element);
+    this.decorateReferences(element, index, sourcePath);
+    this.cleanupOrphanFenceMarkers(element);
+    this.cleanupEmptyParagraphs(element);
+
+    this.debugLog(sourcePath, "render theorem mixed section", {
+      labels: sorted.map((descriptor) => descriptor.label),
+      lineStart: sectionBounds.start,
+      lineEnd: sectionBounds.end,
+      nodeCount: nodes.length
+    });
+    return true;
+  }
+
+  findEquationRenderInfoForSection(index, sectionInfo) {
+    if (!index || !index.labels || !sectionInfo) {
+      return { startDescriptors: [], insideDescriptor: null };
+    }
+
+    const sectionStart = Number.isFinite(sectionInfo.lineStart) ? sectionInfo.lineStart : 0;
+    const sectionEnd = Number.isFinite(sectionInfo.lineEnd) ? sectionInfo.lineEnd : sectionStart;
+    const equationDescriptors = Array.from(index.labels.values())
+      .filter((descriptor) => descriptor.kind === "equation")
+      .sort((a, b) => {
+        if (a.lineStart !== b.lineStart) {
+          return a.lineStart - b.lineStart;
+        }
+        return a.lineEnd - b.lineEnd;
+      });
+
+    const startDescriptors = equationDescriptors.filter((descriptor) => {
+      return descriptor.lineStart >= sectionStart && descriptor.lineStart <= sectionEnd;
+    });
+
+    const insideDescriptor = equationDescriptors.find((descriptor) => {
+      return sectionStart >= descriptor.lineStart && sectionEnd <= descriptor.lineEnd;
+    });
+
+    return { startDescriptors, insideDescriptor };
+  }
+
+  extractEquationBodyFromDescriptor(descriptor, source) {
+    if (!descriptor || !source) {
+      return "";
+    }
+
+    const lines = source.split(/\r?\n/);
+    const start = Math.max(0, Math.min(descriptor.lineStart, lines.length - 1));
+    const end = Math.max(start, Math.min(descriptor.lineEnd, lines.length - 1));
+    const snippetLines = lines.slice(start, end + 1);
+
+    for (const line of snippetLines) {
+      const inlineMatch = line
+        .trim()
+        .match(/^\$\$\s*(.+?)\s*\$\$\s*(?:\{#eq-[A-Za-z0-9_-]+\})?\s*$/);
+      if (inlineMatch) {
+        return (inlineMatch[1] || "").trim();
+      }
+    }
+
+    const bodyLines = [];
+    let inFence = false;
+    for (const line of snippetLines) {
+      const trimmed = line.trim();
+      if (!inFence) {
+        if (trimmed.startsWith("$$")) {
+          if (trimmed === "$$") {
+            inFence = true;
+            continue;
+          }
+
+          const openInlineMatch = trimmed.match(/^\$\$\s*(.+?)\s*$/);
+          if (openInlineMatch && !EQUATION_FENCE_CLOSE_PATTERN.test(trimmed)) {
+            const openBody = (openInlineMatch[1] || "").trim();
+            if (openBody) {
+              bodyLines.push(openBody);
+            }
+            inFence = true;
+            continue;
+          }
+
+          if (EQUATION_FENCE_CLOSE_PATTERN.test(trimmed)) {
+            continue;
+          }
+        }
+        continue;
+      }
+
+      if (EQUATION_FENCE_CLOSE_PATTERN.test(trimmed)) {
+        break;
+      }
+      if (EQUATION_LABEL_ONLY_PATTERN.test(trimmed)) {
+        continue;
+      }
+      bodyLines.push(line);
+    }
+
+    return bodyLines.join("\n").trim();
+  }
+
+  async createEquationNodeFromSource(descriptor, sourcePath, source, index) {
+    const wrapper = document.createElement("div");
+    wrapper.className = "crossref-equation";
+    this.applyTargetHost(wrapper, descriptor.label, "equation");
+
+    const body = this.extractEquationBodyFromDescriptor(descriptor, source);
+    const markdown = body ? `$$\n${body}\n$$` : "$$\n\\phantom{.}\n$$";
+    await MarkdownRenderer.renderMarkdown(markdown, wrapper, sourcePath, this);
+
+    let badge = wrapper.querySelector(".crossref-eq-number");
+    if (!badge) {
+      badge = document.createElement("span");
+      badge.className = "crossref-eq-number";
+      wrapper.appendChild(badge);
+    }
+    badge.dataset.label = descriptor.label;
+    badge.textContent = descriptorDisplay(descriptor);
+
+    this.stripLabelTokens(wrapper);
+    this.decorateReferences(wrapper, index, sourcePath);
+    this.cleanupEmptyParagraphs(wrapper);
+    return wrapper;
+  }
+
+  async renderEquationSection(element, descriptors, sourcePath, source, index, sectionInfo) {
+    if (!(element instanceof HTMLElement) || !Array.isArray(descriptors) || descriptors.length === 0) {
+      return;
+    }
+
+    const sortedDescriptors = descriptors.slice().sort((a, b) => {
+      if (a.lineStart !== b.lineStart) {
+        return a.lineStart - b.lineStart;
+      }
+      return a.lineEnd - b.lineEnd;
+    });
+
+    const nodes = [];
+    for (const descriptor of sortedDescriptors) {
+      const node = await this.createEquationNodeFromSource(descriptor, sourcePath, source, index);
+      nodes.push(node);
+    }
+
+    element.replaceChildren(...nodes);
+    this.debugLog(sourcePath, "render equation section from source", {
+      labels: sortedDescriptors.map((descriptor) => descriptor.label),
+      lineStart: sectionInfo ? sectionInfo.lineStart : null,
+      lineEnd: sectionInfo ? sectionInfo.lineEnd : null
+    });
+  }
+
   async processSection(element, context) {
     if (!context || !context.sourcePath) {
       return;
@@ -871,7 +1345,7 @@ class CrossrefPreviewPlugin extends Plugin {
     const directText = normalizeText(element);
     if (
       this.isDebugSource(sourcePath) &&
-      (THEOREM_START_PATTERN.test(directText) ||
+      (directText.includes(":::") ||
         THEOREM_END_PATTERN.test(directText) ||
         directText.startsWith("## "))
     ) {
@@ -882,21 +1356,60 @@ class CrossrefPreviewPlugin extends Plugin {
       });
     }
 
+    const sectionBounds = this.getSectionBounds(sectionInfo);
+    if (sectionBounds && directText.includes(":::")) {
+      const theoremDescriptors = this.getTheoremDescriptorsForSection(index, sectionBounds);
+      if (theoremDescriptors.length > 0) {
+        const rendered = await this.renderTheoremMixedSection(
+          element,
+          theoremDescriptors,
+          sectionBounds,
+          sourcePath,
+          source,
+          index
+        );
+        if (rendered) {
+          return;
+        }
+      }
+    }
+
     const theoremMatch = this.findTheoremMatchForSection(index, sectionInfo, directText);
     if (theoremMatch) {
       await this.renderTheoremSection(element, theoremMatch, sourcePath, source, index);
       return;
     }
 
+    const equationRenderInfo = this.findEquationRenderInfoForSection(index, sectionInfo);
+    if (equationRenderInfo.startDescriptors.length > 0) {
+      await this.renderEquationSection(
+        element,
+        equationRenderInfo.startDescriptors,
+        sourcePath,
+        source,
+        index,
+        sectionInfo
+      );
+      return;
+    }
+    if (equationRenderInfo.insideDescriptor) {
+      if (element.childNodes.length > 0) {
+        element.replaceChildren();
+      }
+      this.debugLog(sourcePath, "suppress overlapped equation section", {
+        label: equationRenderInfo.insideDescriptor.label,
+        lineStart: sectionInfo ? sectionInfo.lineStart : null,
+        lineEnd: sectionInfo ? sectionInfo.lineEnd : null
+      });
+      return;
+    }
+
     const sectionTargets = this.selectTargetsForSection(index, sectionInfo);
-    const equationLabels = sectionTargets
-      .filter((descriptor) => descriptor.kind === "equation")
-      .map((descriptor) => descriptor.label);
+
     const figureLabels = sectionTargets
       .filter((descriptor) => descriptor.kind === "figure")
       .map((descriptor) => descriptor.label);
 
-    this.decorateEquationTargets(element, equationLabels, index);
     this.decorateFigureTargets(element, figureLabels, index);
     this.stripLabelTokens(element);
     this.decorateReferences(element, index, sourcePath);
@@ -920,7 +1433,7 @@ class CrossrefPreviewPlugin extends Plugin {
     const sectionEnd = Number.isFinite(sectionInfo.lineEnd) ? sectionInfo.lineEnd : sectionStart;
 
     return descriptors.filter((descriptor) => {
-      return descriptor.lineEnd >= sectionStart - 1 && descriptor.lineStart <= sectionEnd + 1;
+      return descriptor.lineEnd >= sectionStart && descriptor.lineStart <= sectionEnd;
     });
   }
 
@@ -1003,6 +1516,19 @@ class CrossrefPreviewPlugin extends Plugin {
     return index;
   }
 
+  getDescriptorForLabel(sourcePath, label) {
+    if (!sourcePath || !label) {
+      return null;
+    }
+
+    const cached = this.indexCache.get(sourcePath);
+    const index = cached ? cached.index : null;
+    if (!index || !index.labels) {
+      return null;
+    }
+    return index.labels.get(label) || null;
+  }
+
   async createTheoremNodeFromSource(descriptor, sourcePath, source, index) {
     const lines = source.split(/\r?\n/);
     const bodyStart = Math.max(0, descriptor.lineStart + 1);
@@ -1051,49 +1577,6 @@ class CrossrefPreviewPlugin extends Plugin {
     return theorem;
   }
 
-  decorateEquationTargets(root, labels, index) {
-    if (!labels.length) {
-      return;
-    }
-
-    const hosts = this.collectEquationHosts(root);
-    const sourcePath = this.getActiveFilePath();
-    if (this.isDebugSource(sourcePath)) {
-      this.debugLog(sourcePath, "decorate equation targets", {
-        labelCount: labels.length,
-        hostCount: hosts.length
-      });
-    }
-    const count = Math.min(labels.length, hosts.length);
-
-    for (let i = 0; i < count; i += 1) {
-      const label = labels[i];
-      const host = hosts[i];
-      if (!host) {
-        continue;
-      }
-
-      const descriptor = index.labels.get(label) || this.createFallbackDescriptor(label);
-      this.applyTargetHost(host, label, "equation");
-
-      let badge = host.querySelector(".crossref-eq-number");
-      if (!badge) {
-        badge = document.createElement("span");
-        badge.className = "crossref-eq-number";
-        host.appendChild(badge);
-      }
-      badge.dataset.label = label;
-      badge.textContent = descriptorDisplay(descriptor);
-
-      if (this.isDebugSource(sourcePath)) {
-        this.debugLog(sourcePath, "equation target attached", {
-          label,
-          hostTag: host.tagName
-        });
-      }
-    }
-  }
-
   decorateFigureTargets(root, labels, index) {
     if (!labels.length) {
       return;
@@ -1122,33 +1605,6 @@ class CrossrefPreviewPlugin extends Plugin {
       caption.dataset.label = label;
       caption.textContent = descriptorDisplay(descriptor);
     }
-  }
-
-  collectEquationHosts(root) {
-    const directMath = Array.from(root.querySelectorAll(".math.math-block, .math-block")).map(
-      (node) => this.resolveEquationHost(node)
-    );
-    const mjxMath = Array.from(root.querySelectorAll("mjx-container[display='true']")).map(
-      (node) => this.resolveEquationHost(node)
-    );
-
-    return dedupeElements(directMath.concat(mjxMath));
-  }
-
-  resolveEquationHost(node) {
-    if (!(node instanceof HTMLElement)) {
-      return null;
-    }
-
-    if (node.tagName.toLowerCase() === "mjx-container") {
-      return (
-        node.closest("figure, div, p, section, blockquote, li") ||
-        node.parentElement ||
-        node
-      );
-    }
-
-    return node.closest("figure, div, p, section, blockquote, li") || node;
   }
 
   applyTargetHost(host, label, kind) {
@@ -1204,7 +1660,9 @@ class CrossrefPreviewPlugin extends Plugin {
         continue;
       }
 
-      const replaced = raw.replace(LABEL_TOKEN_PATTERN, "");
+      const replaced = raw
+        .replace(/\$\$\s*\{#(eq-[A-Za-z0-9_-]+)\}/g, "")
+        .replace(LABEL_TOKEN_PATTERN, "");
       if (replaced !== raw) {
         textNode.nodeValue = replaced;
       }
@@ -1309,8 +1767,11 @@ class CrossrefPreviewPlugin extends Plugin {
       return;
     }
 
-    const focusHost = target.closest("[data-crossref-target]") || target;
     this.clearNativeFlashHighlights(link);
+    const focusHost = this.flashTargetElement(target);
+    if (!focusHost) {
+      return;
+    }
     this.debugLog(this.getActiveFilePath(), "reference click target resolved", {
       label,
       kind:
@@ -1318,11 +1779,6 @@ class CrossrefPreviewPlugin extends Plugin {
           ? focusHost.dataset.crossrefKind
           : "") || ""
     });
-    focusHost.scrollIntoView({ behavior: "smooth", block: "center" });
-    focusHost.classList.add("crossref-target-flash");
-    window.setTimeout(() => {
-      focusHost.classList.remove("crossref-target-flash");
-    }, 1200);
   }
 
   async navigateToReferenceLabel(label, originLink) {
@@ -1331,9 +1787,7 @@ class CrossrefPreviewPlugin extends Plugin {
       return false;
     }
 
-    const cached = this.indexCache.get(sourcePath);
-    const index = cached ? cached.index : null;
-    const descriptor = index && index.labels ? index.labels.get(label) : null;
+    const descriptor = this.getDescriptorForLabel(sourcePath, label);
     if (!descriptor) {
       return false;
     }
@@ -1359,19 +1813,17 @@ class CrossrefPreviewPlugin extends Plugin {
       );
 
       await new Promise((resolve) => {
-        window.setTimeout(resolve, 90);
+        window.setTimeout(resolve, FALLBACK_NAV_RENDER_WAIT_MS);
       });
 
       this.clearNativeFlashHighlights(originLink);
 
       const target = this.findTargetElement(label, originLink);
       if (target) {
-        const focusHost = target.closest("[data-crossref-target]") || target;
-        focusHost.scrollIntoView({ behavior: "smooth", block: "center" });
-        focusHost.classList.add("crossref-target-flash");
-        window.setTimeout(() => {
-          focusHost.classList.remove("crossref-target-flash");
-        }, 1200);
+        const focusHost = this.flashTargetElement(target);
+        if (!focusHost) {
+          return true;
+        }
         this.debugLog(sourcePath, "reference click target resolved", {
           label,
           kind:
@@ -1392,13 +1844,31 @@ class CrossrefPreviewPlugin extends Plugin {
     }
   }
 
+  flashTargetElement(target) {
+    if (!(target instanceof Element)) {
+      return null;
+    }
+
+    const focusHost = target.closest("[data-crossref-target]") || target;
+    if (!(focusHost instanceof Element)) {
+      return null;
+    }
+
+    focusHost.scrollIntoView({ behavior: "smooth", block: "center" });
+    focusHost.classList.add("crossref-target-flash");
+    window.setTimeout(() => {
+      focusHost.classList.remove("crossref-target-flash");
+    }, TARGET_FLASH_DURATION_MS);
+    return focusHost;
+  }
+
   startNativeFlashSuppression() {
     if (!document || !document.body) {
       return;
     }
 
     document.body.classList.add(NATIVE_FLASH_SUPPRESS_CLASS);
-    this.clearDocumentNativeFlashHighlights();
+    this.clearNativeFlashHighlights();
     if (this.nativeFlashSuppressTimer) {
       window.clearTimeout(this.nativeFlashSuppressTimer);
     }
@@ -1411,22 +1881,8 @@ class CrossrefPreviewPlugin extends Plugin {
     }, NATIVE_FLASH_SUPPRESS_DURATION_MS);
   }
 
-  clearDocumentNativeFlashHighlights() {
-    if (!document || typeof document.querySelectorAll !== "function") {
-      return;
-    }
-
-    const flashing = document.querySelectorAll(".is-flashing");
-    for (const node of flashing) {
-      if (!(node instanceof HTMLElement)) {
-        continue;
-      }
-      node.classList.remove("is-flashing");
-    }
-  }
-
-  clearNativeFlashHighlights(originLink) {
-    const roots = this.collectReferenceSearchRoots(originLink);
+  clearNativeFlashHighlights(originLink = null) {
+    const roots = originLink ? this.collectReferenceSearchRoots(originLink) : [document];
     const visited = new Set();
 
     for (const root of roots) {
@@ -1463,9 +1919,7 @@ class CrossrefPreviewPlugin extends Plugin {
     }
 
     const sourcePath = this.getActiveFilePath();
-    const cached = sourcePath ? this.indexCache.get(sourcePath) : null;
-    const index = cached ? cached.index : null;
-    const descriptor = index && index.labels ? index.labels.get(label) : null;
+    const descriptor = this.getDescriptorForLabel(sourcePath, label);
     if (!descriptor) {
       return null;
     }
